@@ -1,0 +1,285 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ── CI: Vet + Test + Coverage (Matrix: Go 1.21, 1.22, 1.23) ────────────────
+  ci:
+    name: CI - Go ${{ matrix.go-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.21', '1.22', '1.23']
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: taskflow
+          POSTGRES_PASSWORD: taskflow_secret
+          POSTGRES_DB: taskflow
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unit test + race detector
+        run: go test -race ./... -timeout 30s
+
+      - name: Integration test
+        env:
+          DATABASE_URL: postgres://taskflow:taskflow_secret@localhost:5432/taskflow?sslmode=disable
+        run: go test -tags=integration -race ./... -timeout 60s
+
+      - name: Coverage check
+        run: |
+          go test ./... -coverprofile=coverage.out -covermode=atomic
+          go tool cover -func=coverage.out
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "Total coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < 50" | bc -l) )); then
+            echo "❌ Coverage $COVERAGE% is below 50%"
+            exit 1
+          fi
+          echo "✅ Coverage $COVERAGE% meets requirement"
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-go-${{ matrix.go-version }}
+          path: coverage.out
+
+      - name: Build binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o bin/taskflow-api ./cmd/server
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskflow-api-binary-go-${{ matrix.go-version }}
+          path: bin/taskflow-api
+
+  # ── Security Scan ───────────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: ci
+    if: always() && needs.ci.result == 'success'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck (SCA)
+        run: |
+          govulncheck -json ./... > govulncheck-report.json || true
+          govulncheck ./... || true
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Run gosec (SAST)
+        run: |
+          gosec -fmt json -out gosec-report.json ./... || true
+          gosec ./... || true
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            govulncheck-report.json
+            gosec-report.json
+
+  # ── CD: Build & Push Docker Image ───────────────────────────────────────────
+  cd:
+    name: CD - Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Output image tag
+        run: echo "Image pushed to ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}"
+
+  # ── Smoke Test ──────────────────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: cd
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: taskflow
+          POSTGRES_PASSWORD: taskflow_secret
+          POSTGRES_DB: taskflow
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Pull and run image
+        env:
+          DATABASE_URL: postgres://taskflow:taskflow_secret@localhost:5432/taskflow?sslmode=disable
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
+          docker run -d --rm \
+            --name taskflow-api \
+            -p 8080:8080 \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e PORT=8080 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
+
+      - name: Wait for startup
+        run: sleep 5
+
+      - name: Smoke test /health
+        run: |
+          curl -sf http://localhost:8080/health || (echo "❌ Health check failed"; exit 1)
+          echo "✅ /health OK"
+
+      - name: Smoke test /api/v1/stats
+        run: |
+          curl -sf http://localhost:8080/api/v1/stats || (echo "❌ Stats endpoint failed"; exit 1)
+          echo "✅ /api/v1/stats OK"
+
+      - name: Cleanup container
+        if: always()
+        run: docker stop taskflow-api || true
+
+  # ── Tag Stable ──────────────────────────────────────────────────────────────
+  tag-stable:
+    name: Tag Stable
+    runs-on: ubuntu-latest
+    needs: [cd, smoke-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && always() && needs.cd.result == 'success' && needs.smoke-test.result == 'success'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Tag and push stable
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable
+          echo "✅ Tagged stable"
+
+  # ── Notification ────────────────────────────────────────────────────────────
+  notify:
+    name: Notification
+    runs-on: ubuntu-latest
+    needs: [ci, cd, smoke-test, tag-stable]
+    if: always()
+
+    steps:
+      - name: Notify Success
+        if: needs.ci.result == 'success' && needs.cd.result == 'success' && needs.smoke-test.result == 'success' && needs.tag-stable.result == 'success'
+        run: |
+          echo "✅ Pipeline SUCCESS"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Notify Failure
+        if: needs.ci.result == 'failure' || needs.cd.result == 'failure' || needs.smoke-test.result == 'failure'
+        run: |
+          echo "❌ Pipeline FAILED"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
