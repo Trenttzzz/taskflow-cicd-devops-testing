@@ -10,8 +10,6 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-
-jobs:
   # ── CI: Vet + Test + Coverage (Matrix: Go 1.21, 1.22, 1.23) ────────────────
   ci:
     name: CI - Go ${{ matrix.go-version }}
