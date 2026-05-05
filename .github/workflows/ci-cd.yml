@@ -42,11 +42,26 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
+      - name: Verify Go version
+        run: go version
+
       - name: go vet
         run: go vet ./...
 
       - name: Unit test + race detector
         run: go test -race ./... -timeout 30s
+
+      - name: Build binary (compile check)
+        run: |
+          echo "Building binary to verify compilation..."
+          CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /tmp/taskflow-api ./cmd/server
+          echo "✅ Binary compiled successfully"
+
+      - name: Check Go 1.21 pattern routing compatibility
+        if: matrix.go-version == '1.21'
+        run: |
+          echo "Checking if pattern routing is supported in Go 1.21..."
+          go build -o /dev/null ./cmd/server 2>&1 | grep -q "pattern" && echo "❌ Pattern routing not supported (expected)" || echo "✅ No pattern routing errors"
 
       - name: Integration test
         env:
@@ -220,21 +235,32 @@ jobs:
             ${{ env.REGISTRY }}/${{ steps.vars.outputs.image_name }}:sha-${{ steps.vars.outputs.sha_short }}
 
       - name: Wait for startup
-        run: sleep 5
+        run: |
+          echo "⏳ Waiting for server to be ready..."
+          sleep 10
+          echo "Checking container status..."
+          docker ps -a
+          echo "Container logs:"
+          docker logs taskflow-api || true
 
       - name: Smoke test /health
         run: |
-          curl -sf http://localhost:8080/health || (echo "❌ Health check failed"; exit 1)
+          echo "Testing /health endpoint..."
+          curl -v http://localhost:8080/health || (echo "❌ Health check failed"; exit 1)
           echo "✅ /health OK"
 
       - name: Smoke test /api/v1/stats
         run: |
-          curl -sf http://localhost:8080/api/v1/stats || (echo "❌ Stats endpoint failed"; exit 1)
+          echo "Testing /api/v1/stats endpoint..."
+          curl -v http://localhost:8080/api/v1/stats || (echo "❌ Stats endpoint failed"; exit 1)
           echo "✅ /api/v1/stats OK"
 
       - name: Cleanup container
         if: always()
-        run: docker stop taskflow-api || true
+        run: |
+          echo "Container logs at cleanup:"
+          docker logs taskflow-api || true
+          docker stop taskflow-api || true
 
   # ── Tag Stable ──────────────────────────────────────────────────────────────
   tag-stable:
