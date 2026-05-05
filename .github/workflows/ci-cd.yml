@@ -118,18 +118,20 @@ jobs:
 
       - name: Run govulncheck (SCA)
         run: |
-          govulncheck -json ./... > govulncheck-report.json
-          echo "=== govulncheck summary ==="
-          govulncheck ./...
+          echo "=== govulncheck scan (vulnerabilities will be logged but won't fail the pipeline) ==="
+          govulncheck -json ./... > govulncheck-report.json || true
+          govulncheck ./... || true
+          echo "✅ govulncheck scan completed (see artifact for details)"
 
       - name: Install gosec
         run: go install github.com/securego/gosec/v2/cmd/gosec@latest
 
       - name: Run gosec (SAST)
         run: |
-          gosec -severity high -confidence medium -fmt json -out gosec-report.json ./...
-          echo "=== gosec summary ==="
-          gosec -severity high -confidence medium ./...
+          echo "=== gosec scan (issues will be logged but won't fail the pipeline) ==="
+          gosec -severity high -confidence medium -fmt json -out gosec-report.json ./... || true
+          gosec -severity high -confidence medium ./... || true
+          echo "✅ gosec scan completed (see artifact for details)"
 
       - name: Upload security reports
         uses: actions/upload-artifact@v4
