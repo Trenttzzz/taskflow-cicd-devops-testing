@@ -4,9 +4,9 @@
 
 **Goal:** Implement end-to-end CI/CD pipeline for TaskFlow Go API including bug fixes, automated testing, Docker image build/push, smoke tests, rollback strategy, and security scanning.
 
-**Architecture:** Multi-job GitHub Actions pipeline with explicit dependencies (CI → CD → Smoke Test → Notify). Go 1.22 backend with PostgreSQL, multi-stage Docker build to scratch image, GHCR registry, conditional stable tagging.
+**Architecture:** Multi-job GitHub Actions pipeline with explicit dependencies (CI → CD → Smoke Test → Notify). Go backend with PostgreSQL, multi-stage Docker build to scratch image, GHCR registry, conditional stable tagging. **Matrix testing across Go 1.21, 1.22, 1.23** — ensures backward compatibility.
 
-**Tech Stack:** Go 1.22, PostgreSQL 16, Docker (multi-stage), GitHub Actions, GitHub Container Registry (GHCR), govulncheck, gosec
+**Tech Stack:** Go 1.21/1.22/1.23 (matrix), PostgreSQL 16, Docker (multi-stage), GitHub Actions, GitHub Container Registry (GHCR), govulncheck, gosec
 
 ---
 
@@ -14,18 +14,166 @@
 
 | File | Responsibility |
 |------|---------------|
+| `internal/handler/handler.go:28-36` | Refactor routing for Go 1.21 compatibility (matrix testing) |
+| `go.mod:3` | Lower Go directive to 1.21 for matrix testing |
 | `internal/service/service.go:172` | Bug #1: integer division in CalculateCompletionRate |
 | `internal/repository/memory.go:58` | Bug #2: inverted filter in FindByStatus |
 | `internal/repository/postgres.go:113` | Bug #2 (postgres): inverted SQL operator |
 | `internal/validator/validator.go:15` | Bug #3: invalid "urgent" priority accepted |
 | `internal/service/service_test.go` | Add ≥2 new test cases |
 | `internal/repository/memory_test.go` | Add ≥2 new test cases |
-| `.github/workflows/ci-cd.yml` | Full CI/CD pipeline definition |
+| `.github/workflows/ci-cd.yml` | Full CI/CD pipeline definition with Go matrix |
 | `scripts/smoke-test.sh` | Smoke test script post-deploy |
 | `scripts/notify.sh` | Notification script for Slack/Telegram |
 | `ROLLBACK_PROCEDURE.md` | One-page rollback documentation |
 | `Dockerfile` | Already exists — multi-stage builder → scratch |
 | `Makefile` | Already exists — may need minor updates |
+
+---
+
+## Task 0: Refactor Routing for Go 1.21 Compatibility (Matrix Testing)
+
+> **Why:** Kelompok 2 requires matrix testing across Go 1.21, 1.22, 1.23. The current code uses Go 1.22's `net/http` pattern routing (`"GET /health"`), which does not exist in Go 1.21. We must refactor to a manual router that works across all three versions.
+
+**Files:**
+- Modify: `internal/handler/handler.go:28-36`
+- Modify: `go.mod:3`
+
+- [ ] **Step 1: Update go.mod to Go 1.21**
+
+Edit `go.mod` line 3:
+
+```go
+// BEFORE:
+go 1.22.0
+
+// AFTER:
+go 1.21
+```
+
+- [ ] **Step 2: Refactor RegisterRoutes to manual routing**
+
+Replace `RegisterRoutes` method in `internal/handler/handler.go` (lines 28-36):
+
+```go
+// BEFORE (Go 1.22 pattern routing — incompatible with Go 1.21):
+func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /health", h.Health)
+	mux.HandleFunc("GET /api/v1/tasks", h.ListTasks)
+	mux.HandleFunc("POST /api/v1/tasks", h.CreateTask)
+	mux.HandleFunc("GET /api/v1/tasks/{id}", h.GetTask)
+	mux.HandleFunc("PUT /api/v1/tasks/{id}", h.UpdateTask)
+	mux.HandleFunc("DELETE /api/v1/tasks/{id}", h.DeleteTask)
+	mux.HandleFunc("GET /api/v1/stats", h.GetStats)
+}
+
+// AFTER (manual routing — compatible with Go 1.21, 1.22, 1.23):
+func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/health", h.route(h.Health, http.MethodGet))
+	mux.HandleFunc("/api/v1/tasks", h.route(h.ListTasks, http.MethodGet, http.MethodPost))
+	mux.HandleFunc("/api/v1/tasks/", h.routeTaskByID)
+	mux.HandleFunc("/api/v1/stats", h.route(h.GetStats, http.MethodGet))
+}
+
+// route wraps a handler to enforce allowed HTTP methods.
+func (h *Handler) route(handler http.HandlerFunc, methods ...string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for _, m := range methods {
+			if r.Method == m {
+				handler(w, r)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// routeTaskByID routes /api/v1/tasks/{id} based on HTTP method.
+func (h *Handler) routeTaskByID(w http.ResponseWriter, r *http.Request) {
+	// Strip prefix to get the ID
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/tasks/")
+	switch r.Method {
+	case http.MethodGet:
+		h.GetTask(w, r.WithContext(context.WithValue(r.Context(), pathKey("id"), id)))
+	case http.MethodPut:
+		h.UpdateTask(w, r.WithContext(context.WithValue(r.Context(), pathKey("id"), id)))
+	case http.MethodDelete:
+		h.DeleteTask(w, r.WithContext(context.WithValue(r.Context(), pathKey("id"), id)))
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+type pathKey string
+```
+
+- [ ] **Step 3: Update GetTask, UpdateTask, DeleteTask to read ID from context**
+
+Edit `GetTask`, `UpdateTask`, `DeleteTask` in `handler.go` to read `id` from context instead of `r.PathValue`:
+
+```go
+func getID(r *http.Request) string {
+	if v := r.Context().Value(pathKey("id")); v != nil {
+		return v.(string)
+	}
+	return ""
+}
+
+// Update GetTask:
+func (h *Handler) GetTask(w http.ResponseWriter, r *http.Request) {
+	task, err := h.svc.GetByID(getID(r))
+	...
+}
+
+// Update UpdateTask:
+func (h *Handler) UpdateTask(w http.ResponseWriter, r *http.Request) {
+	...
+	task, err := h.svc.Update(getID(r), req)
+	...
+}
+
+// Update DeleteTask:
+func (h *Handler) DeleteTask(w http.ResponseWriter, r *http.Request) {
+	deleted, err := h.svc.Delete(getID(r))
+	...
+}
+```
+
+- [ ] **Step 4: Add context import**
+
+Add to imports in `handler.go`:
+
+```go
+import (
+	"context"
+	...
+)
+```
+
+- [ ] **Step 5: Run tests locally with Go 1.22**
+
+```bash
+go mod tidy
+go test ./... -v
+```
+
+Expected: All PASS (routing behavior unchanged)
+
+- [ ] **Step 6: Verify build with Go 1.21 logic**
+
+Since local Go is 1.22, manually verify syntax is 1.21-compatible (no `r.PathValue`, no pattern strings in HandleFunc).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add internal/handler/handler.go go.mod
+git commit -m "refactor: make routing compatible with Go 1.21 for matrix testing
+
+- Replaced Go 1.22 pattern routing with manual method+path routing
+- Added context-based ID passing for /api/v1/tasks/{id}
+- Lowered go.mod directive to 1.21
+- Enables matrix testing across Go 1.21, 1.22, 1.23"
+```
 
 ---
 
@@ -295,7 +443,9 @@ git commit -m "test: add GetStats completion rate and Count after delete tests
 
 ---
 
-## Task 5: Create GitHub Actions CI Pipeline
+## Task 5: Create GitHub Actions CI Pipeline with Go Matrix Testing
+
+> **Kelompok 2 Focus:** Matrix testing across Go 1.21, 1.22, 1.23. The `ci` job runs in parallel for each Go version, ensuring backward compatibility.
 
 **Files:**
 - Create: `.github/workflows/ci-cd.yml`
@@ -306,7 +456,7 @@ git commit -m "test: add GetStats completion rate and Count after delete tests
 mkdir -p .github/workflows
 ```
 
-- [ ] **Step 2: Write CI/CD workflow**
+- [ ] **Step 2: Write CI/CD workflow with Go matrix**
 
 Create `.github/workflows/ci-cd.yml`:
 
@@ -322,13 +472,16 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  GO_VERSION: '1.22'
 
 jobs:
-  # ── CI: Vet + Test + Coverage ──────────────────────────────────────────────
+  # ── CI: Vet + Test + Coverage (Matrix: Go 1.21, 1.22, 1.23) ────────────────
   ci:
-    name: CI - Vet, Test & Coverage
+    name: CI - Go ${{ matrix.go-version }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.21', '1.22', '1.23']
     services:
       postgres:
         image: postgres:16-alpine
@@ -348,10 +501,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Go
+      - name: Setup Go ${{ matrix.go-version }}
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: ${{ matrix.go-version }}
 
       - name: go vet
         run: go vet ./...
@@ -379,7 +532,7 @@ jobs:
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
+          name: coverage-report-go-${{ matrix.go-version }}
           path: coverage.out
 
       - name: Build binary
@@ -389,7 +542,7 @@ jobs:
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: taskflow-api-binary
+          name: taskflow-api-binary-go-${{ matrix.go-version }}
           path: bin/taskflow-api
 
   # ── Security Scan ───────────────────────────────────────────────────────────
@@ -406,7 +559,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: '1.22'
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -605,8 +758,9 @@ jobs:
 
 ```bash
 git add .github/workflows/ci-cd.yml
-git commit -m "ci: add GitHub Actions CI/CD pipeline
+git commit -m "ci: add GitHub Actions CI/CD pipeline with Go matrix testing
 
+- Matrix testing: Go 1.21, 1.22, 1.23 in parallel (Kelompok 2 focus)
 - Multi-job pipeline: CI → Security → CD → Smoke Test → Tag Stable → Notify
 - CI: vet, unit test + race, integration test with postgres, coverage gate ≥75%
 - Security: govulncheck (SCA) + gosec (SAST)
@@ -632,6 +786,8 @@ git push origin main
 
 Go to GitHub → Actions → verify all jobs pass (green checkmarks).
 
+**For matrix testing:** Verify 3 parallel CI jobs (Go 1.21, 1.22, 1.23) all pass.
+
 - [ ] **Step 3: Temporarily reintroduce bug to prove pipeline blocks**
 
 ```bash
@@ -647,6 +803,8 @@ git push origin test-pipeline-red
 - [ ] **Step 4: Verify red pipeline**
 
 Go to GitHub → Actions → verify CI job fails (red X) due to failing test.
+
+**For matrix testing:** Verify all 3 matrix variants (Go 1.21, 1.22, 1.23) show failure.
 
 - [ ] **Step 5: Clean up test branch**
 
@@ -934,7 +1092,7 @@ git push origin main
 ```
 
 Verify in GitHub Actions:
-1. CI job passes (vet, test, integration test, coverage ≥75%)
+1. **Matrix CI jobs pass** (Go 1.21, 1.22, 1.23 — all green)
 2. Security job passes (govulncheck, gosec)
 3. CD job pushes image to GHCR with SHA tag
 4. Smoke test job pulls image and verifies endpoints
@@ -993,6 +1151,8 @@ All should pass.
 | All tests PASS + race detector | Tasks 1-4, Step 4 of Task 10 |
 | Coverage ≥ 75% | Task 4 Step 4, Task 5 CI job |
 | Add ≥2 new test cases | Task 4 |
+| **Matrix testing (Go 1.21, 1.22, 1.23)** | **Task 0 (routing refactor) + Task 5 Step 2 (strategy.matrix)** |
+| **Go 1.21 compatibility** | **Task 0 (manual routing instead of pattern routing)** |
 | CI trigger on push/PR | Task 5 Step 2 (on: push/pull_request) |
 | go vet blocks pipeline | Task 5 Step 2 (vet step) |
 | Unit test + race detector | Task 5 Step 2 |
@@ -1035,6 +1195,7 @@ No placeholders found. All steps contain:
 | `REGISTRY` | Makefile line 4, Task 7 | Makefile line 51,57,63,70-71,77 |
 | `IMAGE_NAME` | Workflow env | Workflow CD job tags |
 | `sha_short` | Workflow steps.vars | Workflow CD/Smoke/Tag jobs |
+| `go-version` | Workflow matrix | Workflow CI job setup-go, artifact names |
 
 All references consistent.
 
@@ -1042,10 +1203,11 @@ All references consistent.
 
 ## Next Steps After Plan Completion
 
-1. Execute tasks sequentially (Task 1 → Task 2 → ... → Task 10)
-2. Each task includes commit steps — push frequently
-3. After Task 5, verify pipeline in GitHub Actions before continuing
-4. Document image size comparison for final report
-5. Collect screenshots: green pipeline, red pipeline, GHCR tags, smoke test output
+1. Execute tasks sequentially (Task 0 → Task 1 → Task 2 → ... → Task 10)
+2. Task 0 is critical: must be done first to enable matrix testing
+3. Each task includes commit steps — push frequently
+4. After Task 5, verify pipeline in GitHub Actions before continuing
+5. Document image size comparison for final report
+6. Collect screenshots: green pipeline (all 3 matrix variants), red pipeline, GHCR tags, smoke test output
 
 **Plan saved to:** `docs/superpowers/plans/2026-05-05-taskflow-cicd-implementation.md`
