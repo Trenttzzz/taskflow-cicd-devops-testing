@@ -218,6 +218,8 @@ Kategori yang dipilih:
 | A - SCA dependency vulnerability | `govulncheck` | Pipeline gagal jika ada reachable vulnerability atau scan error | `govulncheck-report.json` |
 | B - SAST static code analysis | `gosec` | Pipeline gagal untuk severity high dengan confidence medium | `gosec-report.json` |
 
+Catatan pipeline: security job memakai Go `1.25.x` dan versi tool dipin (`govulncheck@v1.3.0`, `gosec@v2.26.1`) supaya SCA/SAST gate deterministik. Matrix testing Go `1.21`, `1.22`, dan `1.23` tetap berjalan di job CI.
+
 ### A. SCA - govulncheck
 
 Alasan pemilihan:
