@@ -17,10 +17,10 @@ func newSvc() *service.TaskService {
 
 func TestCalculateCompletionRate(t *testing.T) {
 	tests := []struct {
-		name    string
-		tasks   []model.Task
-		want    float64
-		isBug   bool
+		name  string
+		tasks []model.Task
+		want  float64
+		isBug bool
 	}{
 		{
 			name:  "tidak ada task",
@@ -259,6 +259,39 @@ func TestRollbackStatusSimulation(t *testing.T) {
 	}
 	if rolled.Status != model.StatusTodo {
 		t.Errorf("Setelah rollback, status = %q, want todo", rolled.Status)
+	}
+}
+
+func TestConcurrentCreate_UniqueIDs(t *testing.T) {
+	svc := newSvc()
+	ids := make(chan string, 100)
+	errs := make(chan error, 100)
+
+	for i := 0; i < 100; i++ {
+		go func() {
+			task, err := svc.Create(model.CreateTaskRequest{Title: "Concurrent Task"})
+			if err != nil {
+				errs <- err
+				return
+			}
+			ids <- task.ID
+			errs <- nil
+		}()
+	}
+
+	seen := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		id := <-ids
+		if id == "" {
+			t.Fatal("Create() returned empty ID")
+		}
+		if seen[id] {
+			t.Fatalf("duplicate ID from concurrent create: %s", id)
+		}
+		seen[id] = true
 	}
 }
 

@@ -10,7 +10,7 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # ── CI: Vet + Test + Coverage (Matrix: Go 1.21, 1.22, 1.23) ────────────────
+  # CI: vet, tests, coverage, and binary build across the required Go matrix.
   ci:
     name: CI - Go ${{ matrix.go-version }}
     runs-on: ubuntu-latest
@@ -51,19 +51,6 @@ jobs:
       - name: Unit test + race detector
         run: go test -race ./... -timeout 30s
 
-      - name: Build binary (compile check)
-        run: |
-          echo "Building binary to verify compilation..."
-          CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /tmp/taskflow-api ./cmd/server
-          echo "✅ Binary compiled successfully"
-
-      - name: Check Go 1.21 compatibility note
-        if: matrix.go-version == '1.21'
-        run: |
-          echo "ℹ️ Note: Go 1.21 uses legacy routing (no method matching)"
-          echo "Pattern routing (GET /path) is a Go 1.22+ feature"
-          echo "This code compiles but routing behavior differs from 1.22+"
-
       - name: Integration test
         env:
           DATABASE_URL: postgres://taskflow:taskflow_secret@localhost:5432/taskflow?sslmode=disable
@@ -75,11 +62,11 @@ jobs:
           go tool cover -func=coverage.out
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
           echo "Total coverage: $COVERAGE%"
-          if (( $(echo "$COVERAGE < 50" | bc -l) )); then
-            echo "❌ Coverage $COVERAGE% is below 50%"
+          awk -v coverage="$COVERAGE" 'BEGIN { exit !(coverage >= 75.0) }' || {
+            echo "Coverage $COVERAGE% is below 75%"
             exit 1
-          fi
-          echo "✅ Coverage $COVERAGE% meets requirement"
+          }
+          echo "Coverage $COVERAGE% meets requirement"
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
@@ -97,12 +84,12 @@ jobs:
           name: taskflow-api-binary-go-${{ matrix.go-version }}
           path: bin/taskflow-api
 
-  # ── Security Scan ───────────────────────────────────────────────────────────
+  # Security: SCA and SAST gates with JSON reports.
   security:
     name: Security Scan
     runs-on: ubuntu-latest
     needs: ci
-    if: always() && needs.ci.result == 'success'
+    if: needs.ci.result == 'success'
 
     steps:
       - name: Checkout code
@@ -111,29 +98,34 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.23'
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
       - name: Run govulncheck (SCA)
+        id: govulncheck
+        continue-on-error: true
         run: |
-          echo "=== govulncheck scan (vulnerabilities will be logged but won't fail the pipeline) ==="
-          govulncheck -json ./... > govulncheck-report.json || true
-          govulncheck ./... || true
-          echo "✅ govulncheck scan completed (see artifact for details)"
+          echo "=== govulncheck scan (SCA gate) ==="
+          govulncheck -json ./... > govulncheck-report.json
+          govulncheck ./...
+          echo "govulncheck scan completed"
 
       - name: Install gosec
         run: go install github.com/securego/gosec/v2/cmd/gosec@latest
 
       - name: Run gosec (SAST)
+        id: gosec
+        continue-on-error: true
         run: |
-          echo "=== gosec scan (issues will be logged but won't fail the pipeline) ==="
-          gosec -severity high -confidence medium -fmt json -out gosec-report.json ./... || true
-          gosec -severity high -confidence medium ./... || true
-          echo "✅ gosec scan completed (see artifact for details)"
+          echo "=== gosec scan (SAST gate: high severity, medium confidence) ==="
+          gosec -severity high -confidence medium -fmt json -out gosec-report.json ./...
+          gosec -severity high -confidence medium ./...
+          echo "gosec scan completed"
 
       - name: Upload security reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: security-reports
@@ -141,12 +133,25 @@ jobs:
             govulncheck-report.json
             gosec-report.json
 
-  # ── CD: Build & Push Docker Image ───────────────────────────────────────────
+      - name: Enforce security gates
+        if: always()
+        run: |
+          if [ "${{ steps.govulncheck.outcome }}" != "success" ]; then
+            echo "SCA gate failed: govulncheck found a vulnerability or scan error"
+            exit 1
+          fi
+          if [ "${{ steps.gosec.outcome }}" != "success" ]; then
+            echo "SAST gate failed: gosec found high severity findings or scan error"
+            exit 1
+          fi
+          echo "Security gates passed"
+
+  # CD: build and push a SHA-tagged image only after CI and security pass.
   cd:
     name: CD - Docker Build & Push
     runs-on: ubuntu-latest
-    needs: ci
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [ci, security]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.ci.result == 'success' && needs.security.result == 'success'
     permissions:
       contents: read
       packages: write
@@ -184,7 +189,7 @@ jobs:
       - name: Output image tag
         run: echo "Image pushed to ${{ env.REGISTRY }}/${{ steps.vars.outputs.image_name }}:sha-${{ steps.vars.outputs.sha_short }}"
 
-  # ── Smoke Test ──────────────────────────────────────────────────────────────
+  # Smoke test: pull the pushed image and verify the deployed endpoints.
   smoke-test:
     name: Smoke Test
     runs-on: ubuntu-latest
@@ -248,23 +253,23 @@ jobs:
 
       - name: Wait for startup
         run: |
-          echo "⏳ Waiting for server to be ready (retrying for 30s)..."
+          echo "Waiting for server to be ready (retrying for 30s)..."
           for i in {1..30}; do
             if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
-              echo "✅ Server is ready after ${i} seconds"
+              echo "Server is ready after ${i} seconds"
               exit 0
             fi
             echo "Attempt $i/30 - not ready yet..."
             # Check if container is still running
             if ! docker ps | grep -q taskflow-api; then
-              echo "❌ Container crashed! Logs:"
+              echo "Container crashed. Logs:"
               docker logs taskflow-api 2>&1 | tail -30 || true
               exit 1
             fi
             docker logs taskflow-api --tail 3 2>&1 || true
             sleep 1
           done
-          echo "❌ Server failed to start within 30 seconds"
+          echo "Server failed to start within 30 seconds"
           echo "Final container logs:"
           docker logs taskflow-api 2>&1 || true
           echo "Container status:"
@@ -274,14 +279,14 @@ jobs:
       - name: Smoke test /health
         run: |
           echo "Testing /health endpoint..."
-          curl -sf http://localhost:8080/health || (echo "❌ Health check failed"; exit 1)
-          echo "✅ /health OK"
+          curl -sf http://localhost:8080/health || (echo "Health check failed"; exit 1)
+          echo "/health OK"
 
       - name: Smoke test /api/v1/stats
         run: |
           echo "Testing /api/v1/stats endpoint..."
-          curl -sf http://localhost:8080/api/v1/stats || (echo "❌ Stats endpoint failed"; exit 1)
-          echo "✅ /api/v1/stats OK"
+          curl -sf http://localhost:8080/api/v1/stats || (echo "Stats endpoint failed"; exit 1)
+          echo "/api/v1/stats OK"
 
       - name: Cleanup container
         if: always()
@@ -291,7 +296,7 @@ jobs:
           docker stop taskflow-api 2>&1 || true
           docker rm taskflow-api 2>&1 || true
 
-  # ── Tag Stable ──────────────────────────────────────────────────────────────
+  # Stable tag: update only after the SHA image passes smoke tests.
   tag-stable:
     name: Tag Stable
     runs-on: ubuntu-latest
@@ -323,28 +328,49 @@ jobs:
           docker pull ${{ env.REGISTRY }}/${{ steps.vars.outputs.image_name }}:sha-${{ steps.vars.outputs.sha_short }}
           docker tag ${{ env.REGISTRY }}/${{ steps.vars.outputs.image_name }}:sha-${{ steps.vars.outputs.sha_short }} ${{ env.REGISTRY }}/${{ steps.vars.outputs.image_name }}:stable
           docker push ${{ env.REGISTRY }}/${{ steps.vars.outputs.image_name }}:stable
-          echo "✅ Tagged stable"
+          echo "Tagged stable"
 
-  # ── Notification ────────────────────────────────────────────────────────────
+  # Notification: logs details and optionally sends Telegram messages.
   notify:
     name: Notification
     runs-on: ubuntu-latest
-    needs: [ci, cd, smoke-test, tag-stable]
+    needs: [ci, security, cd, smoke-test, tag-stable]
     if: always()
 
     steps:
       - name: Notify Success
-        if: needs.ci.result == 'success' && needs.cd.result == 'success' && needs.smoke-test.result == 'success' && needs.tag-stable.result == 'success'
+        if: needs.ci.result == 'success' && needs.security.result == 'success' && needs.cd.result == 'success' && needs.smoke-test.result == 'success' && needs.tag-stable.result == 'success'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          echo "✅ Pipeline SUCCESS"
-          echo "Branch: ${{ github.ref_name }}"
-          echo "Commit: ${{ github.sha }}"
-          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE="Pipeline SUCCESS
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          Time: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "$MESSAGE"
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -sSf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode text="$MESSAGE"
+          fi
 
       - name: Notify Failure
-        if: needs.ci.result == 'failure' || needs.cd.result == 'failure' || needs.smoke-test.result == 'failure'
+        if: needs.ci.result == 'failure' || needs.security.result == 'failure' || needs.cd.result == 'failure' || needs.smoke-test.result == 'failure' || needs.tag-stable.result == 'failure'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          echo "❌ Pipeline FAILED"
-          echo "Branch: ${{ github.ref_name }}"
-          echo "Commit: ${{ github.sha }}"
-          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE="Pipeline FAILED
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          Time: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          Results: ci=${{ needs.ci.result }}, security=${{ needs.security.result }}, cd=${{ needs.cd.result }}, smoke=${{ needs.smoke-test.result }}, stable=${{ needs.tag-stable.result }}
+          Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "$MESSAGE"
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -sSf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode text="$MESSAGE"
+          fi

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/taskflow/api/internal/model"
@@ -15,9 +16,17 @@ import (
 // Pastikan PostgresRepository mengimplementasikan interface TaskRepository.
 var _ TaskRepository = (*PostgresRepository)(nil)
 
+type postgresPool interface {
+	Ping(ctx context.Context) error
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Close()
+}
+
 // PostgresRepository menyimpan task di PostgreSQL menggunakan pgxpool.
 type PostgresRepository struct {
-	pool *pgxpool.Pool
+	pool postgresPool
 }
 
 // NewPostgresRepository membuat koneksi pool ke PostgreSQL.
@@ -141,7 +150,10 @@ func (r *PostgresRepository) Close() error {
 }
 
 // TruncateForTest menghapus semua data — HANYA untuk integration test.
-func (r *PostgresRepository) TruncateForTest(t interface{ Helper(); Fatalf(string, ...interface{}) }) {
+func (r *PostgresRepository) TruncateForTest(t interface {
+	Helper()
+	Fatalf(string, ...interface{})
+}) {
 	t.Helper()
 	if _, err := r.pool.Exec(context.Background(), `TRUNCATE TABLE tasks`); err != nil {
 		t.Fatalf("TruncateForTest error: %v", err)

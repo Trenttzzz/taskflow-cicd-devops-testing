@@ -181,3 +181,25 @@ func TestCount_AfterDelete(t *testing.T) {
 		t.Errorf("Count after deleting non-existent = %d, want 2", count)
 	}
 }
+
+func TestMemoryRepository_ClearCloseAndString(t *testing.T) {
+	r := newRepo(t)
+	saveTask(t, r, "s1", "Task 1", model.StatusTodo)
+
+	if got := r.String(); got != "MemoryRepository{count: 1}" {
+		t.Errorf("String() = %q, want count 1", got)
+	}
+
+	r.Clear()
+	count, err := r.Count()
+	if err != nil {
+		t.Fatalf("Count() error = %v", err)
+	}
+	if count != 0 {
+		t.Errorf("Count() after Clear() = %d, want 0", count)
+	}
+
+	if err := r.Close(); err != nil {
+		t.Errorf("Close() error = %v, want nil", err)
+	}
+}

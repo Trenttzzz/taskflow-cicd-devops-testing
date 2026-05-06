@@ -1,6 +1,6 @@
 module github.com/taskflow/api
 
-go 1.22.0
+go 1.21.0
 
 require github.com/jackc/pgx/v5 v5.6.0
 
